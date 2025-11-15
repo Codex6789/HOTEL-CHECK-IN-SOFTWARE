@@ -1,0 +1,295 @@
+import React, { useEffect, useState, useRef } from "react";
+
+/**
+ Hotel Check Manager - single-file React component
+ Drop this file into a React project (create-react-app / Vite) and render <HotelCheckManager />
+
+ Features
+ - Add bookings with guest name, room, check-in, check-out, city (Makkah or Madinah)
+ - Automatically calculates nights (checkout - checkin)
+ - Shows list, filters, search
+ - Marks reminders: notifies browser 1 day before checkout and 1 day before transfer (if transfer scheduled)
+ - Allows marking "arranged" for transfer or checkout reminder
+ - Persists to localStorage
+ - Export CSV of bookings
+
+ Notes
+ - This uses the Web Notifications API. The browser will ask permission to show notifications.
+ - Notifications only work when the browser is open. For a production system you would use a backend cron job.
+ - Uses Tailwind CSS classes for styling. If you don't have Tailwind, basic styles will still work but not look as intended.
+*/
+
+export default function HotelCheckManager() {
+  const STORAGE_KEY = "hotel_check_manager_bookings_v1";
+  const [bookings, setBookings] = useState(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) {
+      return [];
+    }
+  });
+
+  const [form, setForm] = useState({
+    name: "",
+    room: "",
+    checkIn: "",
+    checkOut: "",
+    city: "Makkah",
+    transfer: false,
+    transferTo: "",
+    notes: "",
+  });
+
+  const [filterCity, setFilterCity] = useState("All");
+  const [query, setQuery] = useState("");
+  const intervalRef = useRef(null);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(bookings));
+  }, [bookings]);
+
+  useEffect(() => {
+    // Request notification permission once
+    if (Notification && Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
+
+    // Interval to check reminders every minute
+    intervalRef.current = setInterval(checkReminders, 60 * 1000);
+    // also run immediately on mount
+    checkReminders();
+
+    return () => clearInterval(intervalRef.current);
+  }, [bookings]);
+
+  function parseDateYMD(s) {
+    // s expected YYYY-MM-DD
+    if (!s) return null;
+    const [y, m, d] = s.split("-").map(Number);
+    return new Date(y, m - 1, d);
+  }
+
+  function nightsBetween(ci, co) {
+    const d1 = parseDateYMD(ci);
+    const d2 = parseDateYMD(co);
+    if (!d1 || !d2) return 0;
+    // calculate by time difference / (1000*60*60*24)
+    const diff = Math.floor((d2 - d1) / (24 * 60 * 60 * 1000));
+    return diff >= 0 ? diff : 0;
+  }
+
+  function addBooking(e) {
+    e.preventDefault();
+    if (!form.name || !form.checkIn || !form.checkOut) return alert("Please fill name, check-in and check-out");
+
+    const newBooking = {
+      id: Date.now().toString(),
+      name: form.name,
+      room: form.room,
+      checkIn: form.checkIn,
+      checkOut: form.checkOut,
+      city: form.city,
+      nights: nightsBetween(form.checkIn, form.checkOut),
+      transfer: !!form.transfer,
+      transferTo: form.transfer ? form.transferTo : "",
+      notes: form.notes,
+      remindedCheckout: false,
+      remindedTransfer: false,
+      arrangedCheckout: false,
+      arrangedTransfer: false,
+      createdAt: new Date().toISOString(),
+    };
+
+    setBookings((b) => [newBooking, ...b]);
+    setForm({ name: "", room: "", checkIn: "", checkOut: "", city: "Makkah", transfer: false, transferTo: "", notes: "" });
+  }
+
+  function daysUntil(dateStr) {
+    const d = parseDateYMD(dateStr);
+    if (!d) return null;
+    const now = new Date();
+    // zero out time portions to compare whole days
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const target = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    return Math.round((target - today) / (24 * 60 * 60 * 1000));
+  }
+
+  function checkReminders() {
+    if (typeof Notification === "undefined") return;
+    if (Notification.permission !== "granted") return;
+
+    setBookings((list) => {
+      return list.map((bk) => {
+        // checkout reminder: 1 day before checkout (daysUntil === 1)
+        const daysToCheckout = daysUntil(bk.checkOut);
+        if (daysToCheckout === 1 && !bk.remindedCheckout && !bk.arrangedCheckout) {
+          showNotification(`Reminder: ${bk.name} checks out tomorrow`, `Room ${bk.room} - checkout ${bk.checkOut}`);
+          bk = { ...bk, remindedCheckout: true };
+        }
+
+        // transfer reminder: if transfer true, remind a day before transfer; we'll assume transfer date == checkout date
+        if (bk.transfer) {
+          const daysToTransfer = daysUntil(bk.checkOut);
+          if (daysToTransfer === 1 && !bk.remindedTransfer && !bk.arrangedTransfer) {
+            showNotification(`Transfer Reminder: ${bk.name} transferable tomorrow`, `From ${bk.city} to ${bk.transferTo} - ${bk.checkOut}`);
+            bk = { ...bk, remindedTransfer: true };
+          }
+        }
+
+        return bk;
+      });
+    });
+  }
+
+  function showNotification(title, body) {
+    try {
+      new Notification(title, { body });
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  function markArranged(id, type) {
+    setBookings((list) => list.map((b) => (b.id === id ? { ...b, [type]: true } : b)));
+  }
+
+  function deleteBooking(id) {
+    if (!confirm("Delete booking?")) return;
+    setBookings((list) => list.filter((b) => b.id !== id));
+  }
+
+  function exportCSV() {
+    const header = ["Name", "Room", "City", "CheckIn", "CheckOut", "Nights", "Transfer", "TransferTo", "Notes"].join(",");
+    const rows = bookings.map((b) => [
+      csvEscape(b.name),
+      csvEscape(b.room),
+      csvEscape(b.city),
+      b.checkIn,
+      b.checkOut,
+      b.nights,
+      b.transfer ? "Yes" : "No",
+      csvEscape(b.transferTo),
+      csvEscape(b.notes),
+    ].join(","));
+
+    const csv = [header, ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "hotel_bookings.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function csvEscape(s) {
+    if (!s) return "";
+    return `\"${(s + "").replace(/\"/g, '""')}\"`;
+  }
+
+  const visible = bookings.filter((b) => {
+    if (filterCity !== "All" && b.city !== filterCity) return false;
+    if (query && !(`${b.name} ${b.room} ${b.notes}`.toLowerCase().includes(query.toLowerCase()))) return false;
+    return true;
+  });
+
+  return (
+    <div className="p-6 max-w-6xl mx-auto">
+      <h1 className="text-2xl font-bold mb-4">Hotel Check Manager</h1>
+
+      <form onSubmit={addBooking} className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-6">
+        <input className="p-2 border rounded" placeholder="Guest name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+        <input className="p-2 border rounded" placeholder="Room" value={form.room} onChange={(e) => setForm({ ...form, room: e.target.value })} />
+        <select className="p-2 border rounded" value={form.city} onChange={(e) => setForm({ ...form, city: e.target.value })}>
+          <option>Makkah</option>
+          <option>Madinah</option>
+        </select>
+
+        <input type="date" className="p-2 border rounded" value={form.checkIn} onChange={(e) => setForm({ ...form, checkIn: e.target.value })} />
+        <input type="date" className="p-2 border rounded" value={form.checkOut} onChange={(e) => setForm({ ...form, checkOut: e.target.value })} />
+
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={form.transfer} onChange={(e) => setForm({ ...form, transfer: e.target.checked })} />
+          Transfer
+        </label>
+
+        {form.transfer && (
+          <input className="p-2 border rounded md:col-span-2" placeholder="Transfer to (Makkah or Madinah)" value={form.transferTo} onChange={(e) => setForm({ ...form, transferTo: e.target.value })} />
+        )}
+
+        <textarea className="p-2 border rounded md:col-span-3" placeholder="Notes" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
+
+        <div className="md:col-span-3 flex gap-2">
+          <button className="px-4 py-2 bg-blue-600 text-white rounded" type="submit">Add booking</button>
+          <button className="px-4 py-2 bg-gray-200 rounded" type="button" onClick={() => { setForm({ name: "", room: "", checkIn: "", checkOut: "", city: "Makkah", transfer: false, transferTo: "", notes: "" }); }}>Reset</button>
+          <button className="px-4 py-2 bg-green-600 text-white rounded" type="button" onClick={exportCSV}>Export CSV</button>
+        </div>
+      </form>
+
+      <div className="flex items-center gap-3 mb-4">
+        <label>Filter city:</label>
+        <select value={filterCity} onChange={(e) => setFilterCity(e.target.value)} className="p-2 border rounded">
+          <option>All</option>
+          <option>Makkah</option>
+          <option>Madinah</option>
+        </select>
+
+        <input placeholder="Search name/room/notes" value={query} onChange={(e) => setQuery(e.target.value)} className="p-2 border rounded flex-1 ml-4" />
+      </div>
+
+      <table className="w-full border-collapse">
+        <thead>
+          <tr className="text-left">
+            <th className="border p-2">Guest</th>
+            <th className="border p-2">Room</th>
+            <th className="border p-2">City</th>
+            <th className="border p-2">Check-in</th>
+            <th className="border p-2">Check-out</th>
+            <th className="border p-2">Nights</th>
+            <th className="border p-2">Transfer</th>
+            <th className="border p-2">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {visible.length === 0 && (
+            <tr><td className="p-4" colSpan={8}>No bookings</td></tr>
+          )}
+
+          {visible.map((b) => (
+            <tr key={b.id} className="hover:bg-gray-50">
+              <td className="border p-2 align-top">
+                <div className="font-semibold">{b.name}</div>
+                <div className="text-sm text-gray-600">{b.notes}</div>
+              </td>
+              <td className="border p-2">{b.room}</td>
+              <td className="border p-2">{b.city}</td>
+              <td className="border p-2">{b.checkIn}</td>
+              <td className="border p-2">{b.checkOut}</td>
+              <td className="border p-2">{b.nights}</td>
+              <td className="border p-2">
+                {b.transfer ? (
+                  <div>
+                    To {b.transferTo}
+                    <div className="text-xs">Reminded: {b.remindedTransfer ? "Yes" : "No"}</div>
+                    <div className="text-xs">Arranged: {b.arrangedTransfer ? "Yes" : "No"}</div>
+                  </div>
+                ) : "-"}
+              </td>
+              <td className="border p-2 align-top flex gap-2 flex-col">
+                <div>Checkout reminded: {b.remindedCheckout ? "Yes" : "No"}</div>
+                <div className="flex gap-2">
+                  {!b.arrangedCheckout && <button className="px-2 py-1 bg-yellow-400 rounded" onClick={() => markArranged(b.id, "arrangedCheckout")}>Mark checkout arranged</button>}
+                  {!b.arrangedTransfer && b.transfer && <button className="px-2 py-1 bg-yellow-400 rounded" onClick={() => markArranged(b.id, "arrangedTransfer")}>Mark transfer arranged</button>}
+                  <button className="px-2 py-1 bg-red-500 text-white rounded" onClick={() => deleteBooking(b.id)}>Delete</button>
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <div className="mt-6 text-sm text-gray-600">Tips: allow browser notifications for automated reminders. For unattended reminders or to make this work when your computer is off, connect this UI to a server that sends emails/SMS or integrates with a calendar.</div>
+    </div>
+  );
+}
